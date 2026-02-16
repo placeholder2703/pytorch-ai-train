@@ -15,6 +15,9 @@ N_LAYER = 4
 SEQ_LEN = 256
 DEVICE = "cpu"
 
+# Train settings
+BATCH_SIZE = 2
+
 # Directories
 DATA_PATH = "data.txt"
 TOKENIZER_PATH = "tokens.json"
@@ -25,26 +28,31 @@ os.makedirs(CHECKPOINT_DIR,exist_ok=True)
 os.makedirs(LOG_DIR,exist_ok=True)
 
 # LR scheduler
+TOTAL_STEPS = 40000
+WARMUP_STEPS = 1000
+MAX_LR = 2e-4
+MIN_LR = 1e-5
+
+# Extras
 BUFFER_MAX = 20000
 BUFFER_MIN = 2000
-TOTAL_STEPS = 80000
-WARMUP_STEPS = 1500
-MAX_LR = 3e-4
-MIN_LR = 1e-5
+doLog = True
 # --------------------
 # LOG
 # --------------------
-log_path=os.path.join(LOG_DIR,f"latest.log")
-log_file=open(log_path,"w",encoding="utf-8")
+if doLog:
+	log_path=os.path.join(LOG_DIR,f"latest.log")
+	log_file=open(log_path,"w",encoding="utf-8")
 def log(showtime, msg):
 	if showtime:
 		line=f"[{time.strftime("%Y-%m-%d %H:%M:%S")}] {msg}"
 	else:
 		line=f"{msg}"
 	print(msg)
-	if log_file:
-		log_file.write(line+"\n")
-		log_file.flush()
+	if doLog:
+		if log_file:
+			log_file.write(line+"\n")
+			log_file.flush()
 log(True, f"[CONFIG] Embeddings: {N_EMBD}")
 log(True, f"[CONFIG] Layer(s): {N_LAYER}")
 log(True, f"[CONFIG] Context length: {SEQ_LEN} tokens")
@@ -119,7 +127,7 @@ class TinyGPT(nn.Module):
 		self.ln_f = nn.LayerNorm(N_EMBD)
 		self.head = nn.Linear(N_EMBD, VOCAB_SIZE)
 	def forward(self, idx):
-		T = idx.size(0)
+		T = idx.size(1)
 		pos = torch.arange(T, device=idx.device)
 		x = self.token_emb(idx) + self.pos_emb(pos)
 		for blk in self.blocks:
@@ -164,10 +172,13 @@ try:
 					stream = token_stream(DATA_PATH)
 					token_buffer.append(next(stream))
 			log(True, f"[STREAM] Refilled tokens buffer")
-		chunk = token_buffer[:SEQ_LEN + 1]
-		token_buffer = token_buffer[SEQ_LEN:]
-		x = torch.tensor(chunk[:-1], dtype=torch.long).unsqueeze(0)
-		y = torch.tensor(chunk[1:], dtype=torch.long).unsqueeze(0)
+		chunks = []
+		for _ in range(BATCH_SIZE):
+			chunk = token_buffer[:SEQ_LEN + 1]
+			token_buffer = token_buffer[SEQ_LEN:]
+			chunks.append(chunk)
+		x = torch.tensor([c[:-1] for c in chunks], dtype=torch.long)
+		y = torch.tensor([c[1:] for c in chunks], dtype=torch.long)
 		start = time.time()
 		logits = model(x)
 		loss = loss_fn(logits.view(-1, VOCAB_SIZE), y.view(-1))
@@ -195,7 +206,7 @@ try:
 			ema_loss = (1 - EMA_ALPHA) * ema_loss + EMA_ALPHA * loss.item()
 		if ema_loss < lowest_ema:
 			lowest_ema = ema_loss
-		log(True, f"[TRAIN] STEP {step} | LOSS {loss.item():.4f} | EMA {ema_loss:.4f} | BUFFER {len(token_buffer)} ({step_time:.0f}ms)")
+		log(True, f"[TRAIN] STEP {step} | LOSS {loss.item():.4f} | EMA {ema_loss:.4f} ({step_time:.0f}ms)")
 		if step % 100 == 0 and step > 0:
 			torch.save({
 				"step": step,
@@ -216,7 +227,7 @@ try:
 		session_steps += 1
 		step += 1
 except KeyboardInterrupt:
-	final_log_path=os.path.join(LOG_DIR,f"{log_start}-{step}.log")
+	final_log_path=os.path.join(LOG_DIR,f"{log_start}-{step}.log") if doLog else "Logging is disabled"
 	avg_loss = loss_sum / loss_count if loss_count > 0 else float("nan")
 	train_end = datetime.now()
 	train_time = int((train_end - train_start).total_seconds())
@@ -228,7 +239,7 @@ except KeyboardInterrupt:
 	log(False, "==========STATS==========")
 	log(False, f"Steps trained: {session_steps}")
 	log(False, f"Time elapsed: {d:02}:{h:02}:{m:02}:{s:02}")
-	log(False, f"Average time/step: {(stime_sum / session_steps):.0f} ms")
+	log(False, f"Average step time: {(stime_sum / session_steps):.0f} ms")
 	log(False, f"Average loss: {avg_loss:.5f}")
 	log(False, f"Lowest loss reached: {lowest_loss:.5f}")
 	log(False, f"Final EMA loss: {ema_loss:.5f}")
@@ -242,6 +253,11 @@ except KeyboardInterrupt:
 		"model_state": model.state_dict(),
 		"optimizer_state": optimizer.state_dict(),
 	}, SAVE_PATH)
-	log_file.close()
-	os.rename(log_path,final_log_path)
+	if doLog:
+		log_file.close()
+		os.rename(log_path,final_log_path)
+	del model
+	del optimizer
+	del token_buffer
+	torch.cuda.empty_cache()
 	input("Press enter to exit...")
